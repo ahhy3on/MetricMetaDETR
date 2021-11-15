@@ -14,14 +14,9 @@ import math
 import os
 import sys
 from typing import Iterable
-
-from torch.nn.functional import avg_pool2d, triplet_margin_loss
 from tqdm import tqdm
-import numpy as np
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
@@ -31,57 +26,6 @@ from datasets import build_dataset, get_coco_api_from_dataset
 import datasets.samplers as samplers
 from torch.utils.data import DataLoader
 from datasets.dataset_cfg import PASCALCLASS,ID2CLASS,CLASS2ID,PASCALCLASSID,PASCALCLASS_BASEID,PASCALCLASS_NOVELID
-
-def binarize(T, nb_classes):
-    import sklearn.preprocessing
-    T = sklearn.preprocessing.label_binarize(
-        T, classes = range(0, nb_classes)
-    )
-    T = torch.FloatTensor(T).cuda()
-    return T
-
-def l2_norm(input):
-    input_size = input.size()
-    buffer = torch.pow(input, 2)
-    normp = torch.sum(buffer, 1).add_(1e-12)
-    norm = torch.sqrt(normp)
-    _output = torch.div(input, norm.view(-1, 1).expand_as(input))
-    output = _output.view(input_size)
-    return output
-
-class Proxy_Anchor(torch.nn.Module):
-    def __init__(self, nb_classes = 20, sz_embed=300, mrg = 0.1, alpha = 32):
-        torch.nn.Module.__init__(self)
-        # Proxy Anchor Initialization
-        self.proxies = torch.nn.Parameter(torch.randn(nb_classes, sz_embed).cuda())
-        nn.init.kaiming_normal_(self.proxies, mode='fan_out')
-
-        self.nb_classes = nb_classes
-        self.sz_embed = sz_embed
-        self.mrg = mrg
-        self.alpha = alpha
-        
-    def forward(self, X, T):
-        P = self.proxies
-
-        cos = F.linear(l2_norm(X), l2_norm(P))  # Calcluate cosine similarity
-        P_one_hot = binarize(T = T, nb_classes = self.nb_classes)
-        N_one_hot = 1 - P_one_hot
-    
-        pos_exp = torch.exp(-self.alpha * (cos - self.mrg))
-        neg_exp = torch.exp(self.alpha * (cos + self.mrg))
-
-        with_pos_proxies = torch.nonzero(P_one_hot.sum(dim = 0) != 0).squeeze(dim = 1)   # The set of positive proxies of data in the batch
-        num_valid_proxies = len(with_pos_proxies)   # The number of positive proxies
-        
-        P_sim_sum = torch.where(P_one_hot == 1, pos_exp, torch.zeros_like(pos_exp)).sum(dim=0) 
-        N_sim_sum = torch.where(N_one_hot == 1, neg_exp, torch.zeros_like(neg_exp)).sum(dim=0)
-        
-        pos_term = torch.log(1 + P_sim_sum).sum() / num_valid_proxies
-        neg_term = torch.log(1 + N_sim_sum).sum() / self.nb_classes
-        loss = pos_term + neg_term     
-        
-        return loss
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     optimizer: torch.optim.Optimizer,
@@ -118,16 +62,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
-    anchorloss = Proxy_Anchor()
+
 
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for idx, _ in enumerate(metric_logger.log_every(range(len(data_loader)), print_freq, header)):
 
-        outputs, cnn_feature = model(samples,targets)
+        outputs = model(samples,targets)
         #print(targets)
-
-        pos_neg_list = []
-        target_list = []
         for j in range(len(targets)-1):
             temp = targets[j]["labels"][0]
             targets[j]["size"]=targets[-1]["size"]
@@ -137,22 +78,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             targets[j]["image_id"]= targets[-1]["image_id"]
             targets[j]["boxes"] = targets[-1]["boxes"][targets[-1]["labels"]==temp]
             targets[j]["labels"] = targets[-1]["labels"][targets[-1]["labels"]==temp]
-            target_list.append(temp.cpu())
-            pos_neg_list.append(bool(sum(targets[-1]["labels"]==temp)))
-
-        target_list = np.array(target_list)
-        cnn_feature = torch.mean(cnn_feature, [2,3]).unsqueeze(1)
         
         targets = targets[:-1]
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-        '''
-        for i,pos_neg in enumerate(pos_neg_list):
-            if not pos_neg:
-                losses+=triplet_margin_loss(cnn_feature[-1],cnn_feature[0],cnn_feature[i+1])
-        '''
-        # losses += anchorloss(torch.mean(outputs['pred_logits'],2),target_list)
 
         #reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -185,7 +115,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
         samples, targets = prefetcher.next()
-        
+        #break
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -281,7 +211,7 @@ def evaluate(model, criterion, postprocessors, device, output_dir,args=None):
         targets = new_targets
         temp_category_code = torch.stack(temp_category_code)
 
-        outputs, cnn_feature = model(samples,targets,predict_category=temp_category_code)
+        outputs = model(samples,targets,predict_category=temp_category_code)
         
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
